@@ -25,6 +25,10 @@ import torch
 from verl import DataProto
 from verl.utils.import_utils import deprecated
 
+_step_times_history = []
+_max_memory_allocated = 0.0
+_max_memory_reserved = 0.0
+
 
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
@@ -248,14 +252,23 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     """
     total_num_tokens = sum(batch.meta_info["global_token_num"])
     time = timing_raw["step"]
+    _step_times_history.append(time)
+    
+    track_memory_usage()
+
     # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)
     # f'Actual TFLOPs/s/GPU​': estimated_flops/(n_gpus),
     # f'Theoretical TFLOPs/s/GPU​': promised_flops,
-    return {
+    metrics = {
         "perf/total_num_tokens": total_num_tokens,
         "perf/time_per_step": time,
         "perf/throughput": total_num_tokens / (time * n_gpus),
     }
+
+    if len(_step_times_history) > 0:
+        metrics["perf/avg_time_per_step"] = sum(_step_times_history) / len(_step_times_history)
+
+    return metrics
 
 
 def bootstrap_metric(
@@ -444,3 +457,39 @@ def process_validation_metrics(
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(prompt_vals)
 
     return data_src2var2metric2val
+
+
+def track_memory_usage() -> None:
+    """
+    Track the current memory usage and update global maximums.
+    
+    This function should be called periodically during training to track
+    the maximum memory allocated and reserved on GPU devices.
+    """
+    global _max_memory_allocated, _max_memory_reserved
+    
+    if torch.cuda.is_available():
+        current_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024  # Convert to GB
+        current_reserved = torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024  # Convert to GB
+
+        _max_memory_allocated = max(_max_memory_allocated, current_allocated)
+        _max_memory_reserved = max(_max_memory_reserved, current_reserved)
+
+
+def get_final_metrics() -> dict[str, float]:
+    if not _step_times_history:
+        return {}
+
+    metrics = {
+        "perf/final_avg_time_per_step": sum(_step_times_history) / len(_step_times_history),
+        "perf/total_steps": len(_step_times_history),
+        "perf/min_time_per_step": min(_step_times_history),
+        "perf/max_time_per_step": max(_step_times_history),
+    }
+    
+    # Add memory metrics if CUDA is available
+    if torch.cuda.is_available():
+        metrics["perf/max_memory_allocated_gb"] = _max_memory_allocated
+        metrics["perf/max_memory_reserved_gb"] = _max_memory_reserved
+    
+    return metrics

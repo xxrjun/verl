@@ -56,6 +56,7 @@ def run_ppo(config) -> None:
         # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
         # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
         ray.init(
+            _temp_dir=os.environ.get("RAY_TMPDIR", "/tmp/ray"),
             runtime_env=get_ppo_ray_runtime_env(),
             num_cpus=config.ray_init.num_cpus,
         )
