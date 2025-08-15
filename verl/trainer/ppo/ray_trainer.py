@@ -51,6 +51,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+    get_final_metrics
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
@@ -1381,6 +1382,7 @@ class RayPPOTrainer:
                 self.global_steps += 1
 
                 if is_last_step:
+                    print(get_final_metrics())
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return

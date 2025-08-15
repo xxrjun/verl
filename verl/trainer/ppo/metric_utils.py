@@ -28,6 +28,7 @@ from verl.utils.import_utils import deprecated
 _step_times_history = []
 _max_memory_allocated = 0.0
 _max_memory_reserved = 0.0
+_warmup_steps = 5
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -265,7 +266,12 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
         "perf/throughput": total_num_tokens / (time * n_gpus),
     }
 
-    if len(_step_times_history) > 0:
+    if len(_step_times_history) > _warmup_steps:
+        # Calculate average excluding warm-up steps
+        training_step_times = _step_times_history[_warmup_steps:]
+        metrics["perf/avg_time_per_step"] = sum(training_step_times) / len(training_step_times)
+    elif len(_step_times_history) > 0:
+        # If we haven't completed warm-up yet, use all available steps
         metrics["perf/avg_time_per_step"] = sum(_step_times_history) / len(_step_times_history)
 
     return metrics
@@ -469,27 +475,53 @@ def track_memory_usage() -> None:
     global _max_memory_allocated, _max_memory_reserved
     
     if torch.cuda.is_available():
-        current_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024  # Convert to GB
-        current_reserved = torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024  # Convert to GB
-
-        _max_memory_allocated = max(_max_memory_allocated, current_allocated)
-        _max_memory_reserved = max(_max_memory_reserved, current_reserved)
+        _max_memory_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024  # Convert to GB
+        _max_memory_reserved = torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024  # Convert to GB
 
 
 def get_final_metrics() -> dict[str, float]:
     if not _step_times_history:
         return {}
-
-    metrics = {
-        "perf/final_avg_time_per_step": sum(_step_times_history) / len(_step_times_history),
+    
+    # Separate warm-up steps from actual training steps
+    if len(_step_times_history) > _warmup_steps:
+        warmup_step_times = _step_times_history[:_warmup_steps]
+        training_step_times = _step_times_history[_warmup_steps:]
+    else:
+        warmup_step_times = _step_times_history
+        training_step_times = _step_times_history
+    
+    # Timing metrics (excluding warm-up steps for main metrics)
+    timing_metrics = {
+        "perf/final_avg_time_per_step": sum(training_step_times) / len(training_step_times),
         "perf/total_steps": len(_step_times_history),
-        "perf/min_time_per_step": min(_step_times_history),
-        "perf/max_time_per_step": max(_step_times_history),
+        "perf/training_steps": len(training_step_times),
+        "perf/warmup_steps": min(_warmup_steps, len(_step_times_history)),
+        "perf/min_time_per_step": min(training_step_times),
+        "perf/max_time_per_step": max(training_step_times),
     }
     
-    # Add memory metrics if CUDA is available
+    # Warm-up metrics (separate section for warm-up analysis)
+    warmup_metrics = {}
+    if warmup_step_times and len(_step_times_history) >= _warmup_steps:
+        warmup_metrics.update({
+            "warmup/avg_time_per_step": sum(warmup_step_times) / len(warmup_step_times),
+            "warmup/min_time_per_step": min(warmup_step_times),
+            "warmup/max_time_per_step": max(warmup_step_times),
+            "warmup/first_step_time": warmup_step_times[0],
+            "warmup/last_step_time": warmup_step_times[-1],
+            
+        })
+    
+    # Memory metrics (separate section)
+    memory_metrics = {}
     if torch.cuda.is_available():
-        metrics["perf/max_memory_allocated_gb"] = _max_memory_allocated
-        metrics["perf/max_memory_reserved_gb"] = _max_memory_reserved
+        memory_metrics.update({
+            "memory/max_memory_allocated_gb": _max_memory_allocated,
+            "memory/max_memory_reserved_gb": _max_memory_reserved,
+        })
+    
+    # Combine all metrics
+    metrics = {**timing_metrics, **warmup_metrics, **memory_metrics}
     
     return metrics
