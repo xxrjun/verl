@@ -28,7 +28,71 @@ from verl.utils.import_utils import deprecated
 _step_times_history = []
 _max_memory_allocated = 0.0
 _max_memory_reserved = 0.0
-_warmup_steps = 5
+
+# Configuration constants
+WARMUP_STEPS = 5
+METRICS_DECIMAL_PLACES = 4  # Number of decimal places for metrics display
+
+
+class MetricsTracker:
+    """A class to track various metrics during training without using global variables."""
+    
+    def __init__(self):
+        self.timing_history = defaultdict(list)
+        self.global_seqlen_max = 0
+        self.prompt_length_max = 0
+        self.response_length_max = 0
+    
+    def update_sequence_lengths(self, prompt_lengths, response_lengths):
+        """Update the maximum sequence lengths seen so far."""
+        # prompt_lengths and response_lengths are tensors from the current batch
+        current_global_seqlen_max = torch.max(prompt_lengths + response_lengths).item()
+        current_prompt_max = torch.max(prompt_lengths).item()
+        current_response_max = torch.max(response_lengths).item()
+        
+        self.global_seqlen_max = max(self.global_seqlen_max, current_global_seqlen_max)
+        self.prompt_length_max = max(self.prompt_length_max, current_prompt_max)
+        self.response_length_max = max(self.response_length_max, current_response_max)
+    
+    def record_timing(self, stage_name: str, timing_value: float):
+        """Record timing for a specific stage."""
+        self.timing_history[stage_name].append(timing_value)
+    
+    def get_sequence_metrics(self) -> dict[str, float]:
+        """Get the maximum sequence length metrics."""
+        return {
+            "sequence/global_seqlen_max": self.global_seqlen_max,
+            "sequence/prompt_length_max": self.prompt_length_max,
+            "sequence/response_length_max": self.response_length_max,
+        }
+    
+    def get_stage_timing_metrics(self) -> dict[str, float]:
+        """Get timing metrics for all stages."""
+        stage_timing_metrics = {}
+        for stage_name, stage_times in self.timing_history.items():
+            if stage_times:
+                # Separate warm-up and training steps for each stage
+                if len(stage_times) > WARMUP_STEPS:
+                    stage_training_times = stage_times[WARMUP_STEPS:]
+                else:
+                    stage_training_times = stage_times
+                
+                # Only include average timing metrics (excluding and including warm-up)
+                if stage_training_times:
+                    avg_time = sum(stage_training_times) / len(stage_training_times)
+                    stage_timing_metrics[f"timing_s/{stage_name}/avg"] = round(avg_time, METRICS_DECIMAL_PLACES)
+                
+                # All steps timing average for each stage
+                # all_avg_time = sum(stage_times) / len(stage_times)
+                # stage_timing_metrics[f"timing/{stage_name}/all_avg"] = round(all_avg_time, METRICS_DECIMAL_PLACES)
+        
+        return stage_timing_metrics
+
+
+# Create a global instance of the metrics tracker
+# Note: We keep this as a module-level variable for backwards compatibility,
+# but it's encapsulated in a class to avoid scattered global variables
+_metrics_tracker = MetricsTracker()
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -123,6 +187,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     prompt_length = response_info["prompt_length"]
     response_length = response_info["response_length"]
 
+    # Update global maximum sequence lengths using the metrics tracker
+    _metrics_tracker.update_sequence_lengths(prompt_length, response_length)
+
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
@@ -208,6 +275,10 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
         - Other stages ("ref", "values", "adv", "update_critic", "update_actor") use all tokens
           (prompt + response)
     """
+    for stage_name, timing_value in timing_raw.items():
+        if stage_name != "start_profile" and stage_name != "stop_profile":
+            _metrics_tracker.record_timing(stage_name, timing_value)
+    
     response_info = _compute_response_info(batch)
     num_prompt_tokens = torch.sum(response_info["prompt_length"]).item()
     num_response_tokens = torch.sum(response_info["response_length"]).item()
@@ -262,17 +333,19 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     # f'Theoretical TFLOPs/s/GPU​': promised_flops,
     metrics = {
         "perf/total_num_tokens": total_num_tokens,
-        "perf/time_per_step": time,
-        "perf/throughput": total_num_tokens / (time * n_gpus),
+        "perf/time_per_step": round(time, METRICS_DECIMAL_PLACES),
+        "perf/throughput": round(total_num_tokens / (time * n_gpus), METRICS_DECIMAL_PLACES),
     }
 
-    if len(_step_times_history) > _warmup_steps:
+    if len(_step_times_history) > WARMUP_STEPS:
         # Calculate average excluding warm-up steps
-        training_step_times = _step_times_history[_warmup_steps:]
-        metrics["perf/avg_time_per_step"] = sum(training_step_times) / len(training_step_times)
+        training_step_times = _step_times_history[WARMUP_STEPS:]
+        avg_time = sum(training_step_times) / len(training_step_times)
+        metrics["perf/avg_time_per_step"] = round(avg_time, METRICS_DECIMAL_PLACES)
     elif len(_step_times_history) > 0:
         # If we haven't completed warm-up yet, use all available steps
-        metrics["perf/avg_time_per_step"] = sum(_step_times_history) / len(_step_times_history)
+        avg_time = sum(_step_times_history) / len(_step_times_history)
+        metrics["perf/avg_time_per_step"] = round(avg_time, METRICS_DECIMAL_PLACES)
 
     return metrics
 
@@ -480,48 +553,64 @@ def track_memory_usage() -> None:
 
 
 def get_final_metrics() -> dict[str, float]:
+    # TODO: add total processing prompt/response tokens    
     if not _step_times_history:
         return {}
     
     # Separate warm-up steps from actual training steps
-    if len(_step_times_history) > _warmup_steps:
-        warmup_step_times = _step_times_history[:_warmup_steps]
-        training_step_times = _step_times_history[_warmup_steps:]
+    if len(_step_times_history) > WARMUP_STEPS:
+        warmup_step_times = _step_times_history[:WARMUP_STEPS]
+        training_step_times = _step_times_history[WARMUP_STEPS:]
     else:
         warmup_step_times = _step_times_history
         training_step_times = _step_times_history
     
     # Timing metrics (excluding warm-up steps for main metrics)
+    final_avg_time = sum(training_step_times) / len(training_step_times)
     timing_metrics = {
-        "perf/final_avg_time_per_step": sum(training_step_times) / len(training_step_times),
+        "perf/final_avg_time_per_step_s": round(final_avg_time, METRICS_DECIMAL_PLACES),
         "perf/total_steps": len(_step_times_history),
         "perf/training_steps": len(training_step_times),
-        "perf/warmup_steps": min(_warmup_steps, len(_step_times_history)),
-        "perf/min_time_per_step": min(training_step_times),
-        "perf/max_time_per_step": max(training_step_times),
+        "perf/warmup_steps": min(WARMUP_STEPS, len(_step_times_history)),
+        "perf/min_time_per_step_s": round(min(training_step_times), METRICS_DECIMAL_PLACES),
+        "perf/max_time_per_step_s": round(max(training_step_times), METRICS_DECIMAL_PLACES),
     }
     
     # Warm-up metrics (separate section for warm-up analysis)
     warmup_metrics = {}
-    if warmup_step_times and len(_step_times_history) >= _warmup_steps:
+    if warmup_step_times and len(_step_times_history) >= WARMUP_STEPS:
+        warmup_avg = sum(warmup_step_times) / len(warmup_step_times)
         warmup_metrics.update({
-            "warmup/avg_time_per_step": sum(warmup_step_times) / len(warmup_step_times),
-            "warmup/min_time_per_step": min(warmup_step_times),
-            "warmup/max_time_per_step": max(warmup_step_times),
-            "warmup/first_step_time": warmup_step_times[0],
-            "warmup/last_step_time": warmup_step_times[-1],
+            "warmup/avg_time_per_step_s": round(warmup_avg, METRICS_DECIMAL_PLACES),
+            # "warmup/min_time_per_step": round(min(warmup_step_times), METRICS_DECIMAL_PLACES),
+            # "warmup/max_time_per_step": round(max(warmup_step_times), METRICS_DECIMAL_PLACES),
+            "warmup/first_step_time_s": round(warmup_step_times[0], METRICS_DECIMAL_PLACES),
+            "warmup/last_step_time_s": round(warmup_step_times[-1], METRICS_DECIMAL_PLACES),
             
         })
+
+    # All steps timing metrics
+    all_avg_time = sum(_step_times_history) / len(_step_times_history)
+    all_steps_metrics = {
+        "perf/all_avg_time_per_step_s": round(all_avg_time, METRICS_DECIMAL_PLACES),
+        # # "perf/all_min_time_per_step": round(min(_step_times_history), METRICS_DECIMAL_PLACES),
+        # "perf/all_max_time_per_step": round(max(_step_times_history), METRICS_DECIMAL_PLACES),
+    }
+
+    # Get stage-specific timing metrics from the metrics tracker
+    stage_timing_metrics = _metrics_tracker.get_stage_timing_metrics()
+
     
-    # Memory metrics (separate section)
-    memory_metrics = {}
-    if torch.cuda.is_available():
-        memory_metrics.update({
-            "memory/max_memory_allocated_gb": _max_memory_allocated,
-            "memory/max_memory_reserved_gb": _max_memory_reserved,
-        })
+    # Get sequence length metrics from the metrics tracker
+    sequence_metrics = _metrics_tracker.get_sequence_metrics()
     
     # Combine all metrics
-    metrics = {**timing_metrics, **warmup_metrics, **memory_metrics}
+    metrics = {
+        **timing_metrics, 
+        **warmup_metrics, 
+        **all_steps_metrics, 
+        **stage_timing_metrics,
+        **sequence_metrics
+    }
     
     return metrics

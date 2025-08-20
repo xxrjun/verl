@@ -51,10 +51,10 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
-    get_final_metrics
+    get_final_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_torch_device, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
@@ -1382,7 +1382,21 @@ class RayPPOTrainer:
                 self.global_steps += 1
 
                 if is_last_step:
-                    print(get_final_metrics())
+                    os.makedirs("./metrics", exist_ok=True)
+                    final_metrics = get_final_metrics()
+
+                    if "perf/max_memory_allocated_gb" in metrics:
+                        final_metrics["perf/max_memory_allocated_gb"] = round(
+                            metrics["perf/max_memory_allocated_gb"], 4
+                        )
+                    if "perf/max_memory_reserved_gb" in metrics:
+                        final_metrics["perf/max_memory_reserved_gb"] = round(metrics["perf/max_memory_reserved_gb"], 4)
+
+                    with open(f"./metrics/{self.config.trainer.experiment_name}.json", "w") as f:
+                        json.dump(final_metrics, f)
+
+                    print(json.dumps(final_metrics))
+
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
