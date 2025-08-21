@@ -471,7 +471,13 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
-                    loss.backward()
+                    with marked_timer(
+                        name="backward",
+                        timing_raw=timing_raw,
+                        domain="update_policy",
+                        category="backward",
+                    ):
+                        loss.backward()
 
                     micro_batch_metrics.update(
                         {
